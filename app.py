@@ -10,10 +10,26 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-import core
-
 st.set_page_config(page_title="Call Coverage", page_icon="📞", layout="wide")
-core.init_db()
+
+# Make Streamlit secrets (e.g. DATABASE_URL) visible to core.py before it connects.
+try:
+    for _k in ("DATABASE_URL", "ADMIN_PASSWORD"):
+        if _k in st.secrets and not os.environ.get(_k):
+            os.environ[_k] = str(st.secrets[_k])
+except Exception:
+    pass
+
+import core  # noqa: E402
+
+
+@st.cache_resource
+def _init_db() -> bool:
+    core.init_db()
+    return True
+
+
+_init_db()
 
 NONE = "—"
 
@@ -366,17 +382,16 @@ def tab_summary() -> None:
     st.dataframe(df, hide_index=True, width="stretch")
     st.download_button("Download summary CSV", df.to_csv(index=False), file_name="call_summary.csv")
 
-    assigned = core.get_assignments(block["id"])
-    people = {p["id"]: p["name"] for p in core.get_people(active_only=False)}
-    out = pd.DataFrame(
-        [
-            {"Date": d.isoformat(), "Day": d.strftime("%a"),
-             "Type": core.day_type(d, core.get_holidays()),
-             "Assigned": people.get(assigned.get(d.isoformat()), "")}
-            for d in core.block_dates(block)
-        ]
+    out = core.schedule_df(block["id"])
+    c1, c2, _ = st.columns([1, 1, 3])
+    c1.download_button(
+        "Download schedule (Excel)",
+        core.schedule_xlsx(block["id"]),
+        file_name=f"call_schedule_{block['name'].replace(' ', '_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
     )
-    st.download_button("Download schedule CSV", out.to_csv(index=False), file_name="call_schedule.csv")
+    c2.download_button("Download schedule CSV", out.to_csv(index=False), file_name="call_schedule.csv")
 
 
 def admin_page() -> None:
@@ -399,6 +414,8 @@ def admin_page() -> None:
 
 # ======================================================================== main
 page = st.sidebar.radio("Go to", ["Volunteer", "Scheduler"])
+if not core.using_postgres():
+    st.sidebar.caption("⚠️ Storage: local SQLite file. Data will be lost on Streamlit Cloud restarts. Set DATABASE_URL.")
 if page == "Volunteer":
     resident_page()
 else:
