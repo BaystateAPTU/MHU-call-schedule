@@ -14,7 +14,7 @@ st.set_page_config(page_title="Call Coverage", page_icon="📞", layout="wide")
 
 # Make Streamlit secrets (e.g. DATABASE_URL) visible to core.py before it connects.
 try:
-    for _k in ("DATABASE_URL", "ADMIN_PASSWORD"):
+    for _k in ("DATABASE_URL", "ADMIN_PASSWORD", "SIGNUP_CODE"):
         if _k in st.secrets and not os.environ.get(_k):
             os.environ[_k] = str(st.secrets[_k])
 except Exception:
@@ -32,6 +32,78 @@ def _init_db() -> bool:
 _init_db()
 
 NONE = "—"
+MIN_PIN = 4
+
+
+def signup_code() -> str:
+    """Optional shared code people must enter to create an account (blank = open sign-up)."""
+    try:
+        code = st.secrets.get("SIGNUP_CODE")
+    except Exception:
+        code = None
+    return str(code or os.environ.get("SIGNUP_CODE", "")).strip()
+
+
+def pin_problem(pin: str, confirm: str) -> str | None:
+    if len(pin) < MIN_PIN:
+        return f"PIN must be at least {MIN_PIN} characters."
+    if pin != confirm:
+        return "PINs don't match."
+    return None
+
+
+def sign_in(pid: int, name: str) -> None:
+    st.session_state["resident_id"] = pid
+    st.session_state["resident_name"] = name
+    st.rerun()
+
+
+def resident_auth() -> None:
+    people = core.get_people()
+    t_in, t_new = st.tabs(["Sign in", "New here? Create an account"])
+
+    with t_in:
+        if not people:
+            st.info("Nobody has signed up yet — use **Create an account**.")
+        else:
+            with st.form("login"):
+                name = st.selectbox("Your name", [p["name"] for p in people])
+                pin = st.text_input("PIN", type="password")
+                if st.form_submit_button("Sign in", type="primary"):
+                    pid = next(p["id"] for p in people if p["name"] == name)
+                    if core.check_pin(pid, pin):
+                        sign_in(pid, name)
+                    else:
+                        st.error("Name or PIN didn't match. Forgot it? Ask the scheduler to reset it.")
+
+    with t_new:
+        code_needed = signup_code()
+        with st.form("signup"):
+            st.caption("Use the name you want to appear on the schedule (e.g. *Jane Smith*).")
+            name = st.text_input("Your name")
+            c1, c2 = st.columns(2)
+            pin = c1.text_input(f"Choose a PIN (at least {MIN_PIN} characters)", type="password")
+            confirm = c2.text_input("Confirm PIN", type="password")
+            code = st.text_input("Sign-up code (from the scheduler)", type="password") if code_needed else ""
+            if st.form_submit_button("Create account", type="primary"):
+                clean = core.clean_name(name)
+                problem = pin_problem(pin, confirm)
+                if len(clean) < 2:
+                    st.error("Enter your name.")
+                elif problem:
+                    st.error(problem)
+                elif code_needed and code.strip() != code_needed:
+                    st.error("Sign-up code is incorrect.")
+                elif core.name_taken(clean):
+                    st.error(f"“{clean}” is already registered. Sign in instead, or ask the scheduler "
+                             "to reset your PIN.")
+                else:
+                    try:
+                        pid = core.add_person(clean, pin)
+                    except Exception:
+                        st.error("Couldn't create that account — the name may already be taken.")
+                    else:
+                        sign_in(pid, clean)
 
 
 def admin_password() -> str:
@@ -46,23 +118,8 @@ def admin_password() -> str:
 def resident_page() -> None:
     st.header("Volunteer for call")
 
-    people = core.get_people()
-    if not people:
-        st.info("No people have been added yet. Ask the scheduler to add you.")
-        return
-
     if "resident_id" not in st.session_state:
-        with st.form("login"):
-            name = st.selectbox("Your name", [p["name"] for p in people])
-            pin = st.text_input("PIN", type="password")
-            if st.form_submit_button("Sign in"):
-                pid = next(p["id"] for p in people if p["name"] == name)
-                if core.check_pin(pid, pin):
-                    st.session_state["resident_id"] = pid
-                    st.session_state["resident_name"] = name
-                    st.rerun()
-                else:
-                    st.error("Name or PIN didn't match.")
+        resident_auth()
         return
 
     pid, name = st.session_state["resident_id"], st.session_state["resident_name"]
@@ -72,6 +129,22 @@ def resident_page() -> None:
         for k in ("resident_id", "resident_name"):
             st.session_state.pop(k, None)
         st.rerun()
+
+    with st.expander("Change my PIN"):
+        with st.form("change_pin", clear_on_submit=True):
+            cur = st.text_input("Current PIN", type="password")
+            c1, c2 = st.columns(2)
+            new = c1.text_input("New PIN", type="password")
+            confirm = c2.text_input("Confirm new PIN", type="password")
+            if st.form_submit_button("Update PIN"):
+                problem = pin_problem(new, confirm)
+                if not core.check_pin(pid, cur):
+                    st.error("Current PIN is incorrect.")
+                elif problem:
+                    st.error(problem)
+                else:
+                    core.set_pin(pid, new)
+                    st.success("PIN updated.")
 
     blocks = core.get_blocks("open")
     if not blocks:
@@ -92,17 +165,19 @@ def resident_page() -> None:
     rows = []
     for d in core.block_dates(block):
         t = core.day_type(d, hol)
+        h = core.holiday_label(d, hol)
         if view == "Weekends" and t != "weekend":
             continue
         if view == "Weekdays" and t != "weekday":
             continue
-        if view == "Holidays" and t != "holiday":
+        if view == "Holidays" and not h:
             continue
         rows.append(
             {
                 "Date": d.isoformat(),
                 "Day": d.strftime("%a"),
-                "Type": t + (f" ({hol[d.isoformat()]})" if d.isoformat() in hol and hol[d.isoformat()] else ""),
+                "Type": t,
+                "Holiday": f"🎉 {h}" if h else "",
                 "Availability": mine.get(d.isoformat(), NONE),
             }
         )
@@ -113,7 +188,7 @@ def resident_page() -> None:
         hide_index=True,
         width="stretch",
         height=560,
-        disabled=["Date", "Day", "Type"],
+        disabled=["Date", "Day", "Type", "Holiday"],
         column_config={
             "Availability": st.column_config.SelectboxColumn(
                 options=[NONE, "Preferred", "Willing"], required=True
@@ -185,8 +260,28 @@ def tab_blocks() -> None:
             st.rerun()
 
     st.subheader("Holidays")
-    st.caption("Dates listed here count as holiday coverage instead of weekday/weekend.")
+    st.caption("Holidays are flagged on the calendar (🎉) so people can see them. They are scheduled and "
+               "counted as the normal weekday or weekend shift they fall on.")
     hol = core.get_holidays()
+    with st.form("holiday_range", clear_on_submit=True):
+        st.markdown("**Add a holiday or date range**")
+        c1, c2, c3 = st.columns([2, 1, 1])
+        h_name = c1.text_input("Name", placeholder="Winter break")
+        h_start = c2.date_input("From", value=None, format="MM/DD/YYYY")
+        h_end = c3.date_input("To (leave blank for one day)", value=None, format="MM/DD/YYYY")
+        if st.form_submit_button("Add"):
+            h_end = h_end or h_start
+            if not h_start:
+                st.error("Pick a start date.")
+            elif h_end < h_start:
+                st.error("End date is before start date.")
+            elif (h_end - h_start).days > 60:
+                st.error("That range is over 60 days — check the dates.")
+            else:
+                n = core.add_holiday_range(h_name.strip(), h_start, h_end)
+                st.success(f"Added {n} day{'s' if n != 1 else ''}.")
+                st.rerun()
+    st.caption("All holiday dates (edit names or delete rows here, then Save):")
     hdf = pd.DataFrame(
         {"Date": [date.fromisoformat(d) for d in sorted(hol)], "Name": [hol[d] for d in sorted(hol)]}
     )
@@ -209,6 +304,9 @@ def tab_blocks() -> None:
 
 def tab_people() -> None:
     st.subheader("People")
+    st.caption("People can sign up themselves on the Volunteer page"
+               + (" (with the sign-up code)." if signup_code() else ".")
+               + " You can also add someone here, or untick **Active** to hide a duplicate or someone who left.")
     with st.form("new_person", clear_on_submit=True):
         c1, c2 = st.columns(2)
         name = c1.text_input("Name")
@@ -217,12 +315,12 @@ def tab_people() -> None:
             if not name.strip() or not pin.strip():
                 st.error("Name and PIN are both required.")
             else:
-                try:
-                    core.add_person(name, pin)
-                    st.success(f"Added {name.strip()}.")
-                    st.rerun()
-                except Exception:
+                if core.name_taken(name):
                     st.error("That name already exists.")
+                else:
+                    core.add_person(name, pin)
+                    st.success(f"Added {core.clean_name(name)}.")
+                    st.rerun()
 
     people = core.get_people(active_only=False)
     if not people:
@@ -236,7 +334,6 @@ def tab_people() -> None:
             {
                 "id": p["id"], "Name": p["name"], "Active": bool(p["active"]),
                 "Carry weekday": p["carry_weekday"], "Carry weekend": p["carry_weekend"],
-                "Carry holiday": p["carry_holiday"],
             }
             for p in people
         ]
@@ -247,15 +344,13 @@ def tab_people() -> None:
             "id": None,
             "Carry weekday": st.column_config.NumberColumn(min_value=0, step=1),
             "Carry weekend": st.column_config.NumberColumn(min_value=0, step=1),
-            "Carry holiday": st.column_config.NumberColumn(min_value=0, step=1),
         },
     )
     if st.button("Save people"):
         for _, r in edited.iterrows():
             core.execute(
-                "UPDATE people SET active=?, carry_weekday=?, carry_weekend=?, carry_holiday=? WHERE id=?",
-                (int(r["Active"]), int(r["Carry weekday"]), int(r["Carry weekend"]),
-                 int(r["Carry holiday"]), int(r["id"])),
+                "UPDATE people SET active=?, carry_weekday=?, carry_weekend=? WHERE id=?",
+                (int(r["Active"]), int(r["Carry weekday"]), int(r["Carry weekend"]), int(r["id"])),
             )
         st.success("Saved.")
         st.rerun()
@@ -316,6 +411,7 @@ def tab_assign() -> None:
                 "Date": iso,
                 "Day": d.strftime("%a"),
                 "Type": core.day_type(d, hol),
+                "Holiday": f"🎉 {core.holiday_label(d, hol)}" if iso in hol else "",
                 "# Vol": len(cand),
                 "Volunteers (ranked, * = preferred)": ranked,
                 "Assigned": names.get(assigned.get(iso), NONE) if assigned.get(iso) in names else NONE,
@@ -327,8 +423,10 @@ def tab_assign() -> None:
     mask = pd.Series(True, index=df.index)
     if show == "Unassigned":
         mask = df["Assigned"] == NONE
-    elif show in ("Weekends", "Weekdays", "Holidays"):
-        mask = df["Type"] == {"Weekends": "weekend", "Weekdays": "weekday", "Holidays": "holiday"}[show]
+    elif show == "Holidays":
+        mask = df["Holiday"] != ""
+    elif show in ("Weekends", "Weekdays"):
+        mask = df["Type"] == {"Weekends": "weekend", "Weekdays": "weekday"}[show]
 
     if gaps:
         st.warning(f"{len(gaps)} dates have no volunteers and no assignment yet.")
@@ -339,7 +437,7 @@ def tab_assign() -> None:
         hide_index=True,
         width="stretch",
         height=620,
-        disabled=["Date", "Day", "Type", "# Vol", "Volunteers (ranked, * = preferred)"],
+        disabled=["Date", "Day", "Type", "Holiday", "# Vol", "Volunteers (ranked, * = preferred)"],
         column_config={
             "Assigned": st.column_config.SelectboxColumn(options=[NONE] + sorted(id_by_name), required=True),
             "# Vol": st.column_config.NumberColumn(width="small"),
