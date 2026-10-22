@@ -12,7 +12,7 @@ import pandas as pd
 
 DB_PATH = os.environ.get("CALL_DB", "call_schedule.db")
 LEVELS = ("Preferred", "Willing")
-TYPES = ("weekday", "weekend", "holiday")
+TYPES = ("weekday", "weekend")  # holidays are flagged, not a separate shift type
 
 # Storage: if DATABASE_URL is set (Neon / Supabase Postgres), use it. Otherwise fall
 # back to a local SQLite file, which is fine on your own computer but is WIPED on
@@ -160,8 +160,22 @@ def hash_pin(pin: str) -> str:
     return hashlib.pbkdf2_hmac("sha256", pin.encode(), b"call-volunteer-v1", 50_000).hex()
 
 
-def add_person(name: str, pin: str) -> None:
-    execute("INSERT INTO people (name, pin_hash) VALUES (?, ?)", (name.strip(), hash_pin(pin)))
+def clean_name(name: str) -> str:
+    return " ".join(name.split())
+
+
+def name_taken(name: str) -> bool:
+    rows = query("SELECT 1 FROM people WHERE LOWER(name)=LOWER(?)", (clean_name(name),))
+    return bool(rows)
+
+
+def add_person(name: str, pin: str) -> int:
+    with conn() as c:
+        cur = c.execute(
+            "INSERT INTO people (name, pin_hash) VALUES (?, ?) RETURNING id",
+            (clean_name(name), hash_pin(pin)),
+        )
+        return cur.fetchone()["id"]
 
 
 def set_pin(person_id: int, pin: str) -> None:
@@ -219,10 +233,31 @@ def replace_holidays(rows: list[tuple[str, str]]) -> None:
             "ON CONFLICT (date) DO UPDATE SET name = excluded.name", rows)
 
 
-def day_type(d: date, holidays: dict[str, str] | set[str]) -> str:
-    if d.isoformat() in holidays:
-        return "holiday"
+def add_holiday_range(name: str, start: date, end: date) -> int:
+    """Flag every date from start to end (inclusive) as a holiday. Returns days added/updated."""
+    rows = []
+    d = start
+    while d <= end:
+        rows.append((d.isoformat(), name))
+        d += timedelta(days=1)
+    with conn() as c:
+        c.executemany("INSERT INTO holidays (date, name) VALUES (?,?) "
+            "ON CONFLICT (date) DO UPDATE SET name = excluded.name", rows)
+    return len(rows)
+
+
+def day_type(d: date, holidays: dict[str, str] | set[str] | None = None) -> str:
+    """weekday or weekend. Holidays are flagged on the calendar but count as the
+    normal weekday/weekend shift they fall on (they are not scheduled separately)."""
     return "weekend" if d.weekday() >= 5 else "weekday"
+
+
+def holiday_label(d: date, holidays: dict[str, str]) -> str:
+    """'' if not a holiday, else the holiday's name (or 'Holiday' if unnamed)."""
+    iso = d.isoformat()
+    if iso not in holidays:
+        return ""
+    return holidays[iso] or "Holiday"
 
 
 # ------------------------------------------------------------- availability
@@ -286,17 +321,10 @@ def person_stats(block_id: int) -> dict[int, dict]:
             "pref": 0,
             "will": 0,
             "vol": 0,
-            "life": {
-                "weekday": p["carry_weekday"],
-                "weekend": p["carry_weekend"],
-                "holiday": p["carry_holiday"],
-            },
-            "block": {"weekday": 0, "weekend": 0, "holiday": 0},
-            "carry": {
-                "weekday": p["carry_weekday"],
-                "weekend": p["carry_weekend"],
-                "holiday": p["carry_holiday"],
-            },
+            "life": {"weekday": p["carry_weekday"], "weekend": p["carry_weekend"]},
+            "block": {"weekday": 0, "weekend": 0},
+            "carry": {"weekday": p["carry_weekday"], "weekend": p["carry_weekend"]},
+            "hol_block": 0,  # info only: assigned dates this block that are flagged holidays
         }
     for r in query("SELECT person_id, level FROM availability WHERE block_id=?", (block_id,)):
         s = stats.get(r["person_id"])
@@ -312,6 +340,8 @@ def person_stats(block_id: int) -> dict[int, dict]:
         s["life"][t] += 1
         if r["block_id"] == block_id:
             s["block"][t] += 1
+            if r["date"] in hol:
+                s["hol_block"] += 1
     return stats
 
 
@@ -395,10 +425,9 @@ def summary_df(block_id: int) -> pd.DataFrame:
                 "Assigned (block)": n_assigned,
                 "Weekday": b["weekday"],
                 "Weekend": b["weekend"],
-                "Holiday": b["holiday"],
+                "Holidays (incl.)": s["hol_block"],
                 "Lifetime weekday": life["weekday"],
                 "Lifetime weekend": life["weekend"],
-                "Lifetime holiday": life["holiday"],
                 "Lifetime total": sum(life.values()),
             }
         )
@@ -418,7 +447,7 @@ def schedule_df(block_id: int) -> pd.DataFrame:
                 "Date": d.isoformat(),
                 "Day": d.strftime("%a"),
                 "Type": day_type(d, hol),
-                "Holiday": hol.get(d.isoformat(), ""),
+                "Holiday": holiday_label(d, hol),
                 "Assigned": people.get(assigned.get(d.isoformat()), ""),
             }
             for d in block_dates(block)
@@ -465,22 +494,23 @@ def schedule_xlsx(block_id: int) -> bytes:
         ws.append([date.fromisoformat(r.Date), r.Day, r.Type.title(), r.Holiday, r.Assigned or "UNASSIGNED"])
         row = ws.max_row
         ws.cell(row=row, column=1).number_format = "mm/dd/yyyy"
-        if r.Type in fills:
+        fill = fills["holiday"] if r.Holiday else fills.get(r.Type)
+        if fill:
             for col in range(1, 6):
-                ws.cell(row=row, column=col).fill = fills[r.Type]
+                ws.cell(row=row, column=col).fill = fill
         if not r.Assigned:
             ws.cell(row=row, column=5).font = gap_font
     ws.auto_filter.ref = f"A2:E{ws.max_row}"
 
     # By person
     wp = wb.create_sheet("By person")
-    header(wp, ["Person", "Date", "Day", "Type"], [26, 13, 7, 11])
+    header(wp, ["Person", "Date", "Day", "Type", "Holiday"], [26, 13, 7, 11, 22])
     taken = sched[sched["Assigned"] != ""].sort_values(["Assigned", "Date"])
     for r in taken.itertuples(index=False):
-        wp.append([r.Assigned, date.fromisoformat(r.Date), r.Day, r.Type.title()])
+        wp.append([r.Assigned, date.fromisoformat(r.Date), r.Day, r.Type.title(), r.Holiday])
         wp.cell(row=wp.max_row, column=2).number_format = "mm/dd/yyyy"
     if wp.max_row > 1:
-        wp.auto_filter.ref = f"A1:D{wp.max_row}"
+        wp.auto_filter.ref = f"A1:E{wp.max_row}"
 
     # Summary
     wsum = wb.create_sheet("Summary")
