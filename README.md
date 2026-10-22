@@ -7,6 +7,12 @@ Residents volunteer for dates; you rank the volunteers and assign. Built for 6-m
 pip install -r requirements.txt
 ADMIN_PASSWORD=choose-one streamlit run app.py
 ```
+Storage
+Set DATABASE_URL to a Postgres connection string (Neon or Supabase) and all data lives there. That is required on Streamlit Community Cloud, whose disk is wiped on restart. On Streamlit Cloud put it in App settings > Secrets:
+DATABASE_URL = "postgresql://...?sslmode=require"
+ADMIN_PASSWORD = "choose-one"
+Without DATABASE_URL the app falls back to the local SQLite file below (fine on your own computer) and shows a warning in the sidebar.
+
 Data lives in `call_schedule.db` (SQLite) next to the app. Set `CALL_DB=/path/to.db` to move it.
 Back that file up; it is the whole system.
 
