@@ -27,7 +27,7 @@ import core  # noqa: E402
 # Streamlit Cloud reruns app.py after a git pull but keeps the old `core` module in memory.
 # Reload it whenever core.py has changed on disk (closing the old DB pool first).
 _core_mtime = os.path.getmtime(core.__file__)
-if getattr(core, "_loaded_mtime", _core_mtime) != _core_mtime:
+if getattr(core, "_loaded_mtime", None) != _core_mtime:  # also true for a copy loaded before this check existed
     _old_pool = getattr(core, "_pool", None)
     core = importlib.reload(core)
     if _old_pool is not None:
