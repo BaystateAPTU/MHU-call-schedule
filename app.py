@@ -154,6 +154,114 @@ def resident_page() -> None:
         "Block", blocks, format_func=lambda b: f"{b['name']} ({b['start_date']} to {b['end_date']})"
     )
 
+    mode = st.segmented_control(
+        "View", ["📅 Calendar", "📋 List"], default="📅 Calendar", key="vol_view_mode"
+    )
+    if mode == "📋 List":
+        availability_list(block, pid)
+    else:
+        availability_calendar(block, pid)
+
+
+CAL_CSS = """
+<style>
+.st-key-calgrid [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 4px !important; }
+.st-key-calgrid [data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }
+.st-key-calgrid .dow { text-align: center; font-size: .75rem; opacity: .7; font-weight: 600; }
+[class*="st-key-cell-"], [class*="st-key-cell-"] > div, [class*="st-key-cell-"] [data-testid="stButton"] { width: 100% !important; }
+[class*="st-key-cell-"] button {
+    width: 100%; min-height: 3.1rem; padding: 2px 0 !important; font-size: .9rem; line-height: 1.1;
+}
+[class*="st-key-cell-"][class*="-we-"] button { background: rgba(120,140,170,.14); }
+[class*="st-key-cell-"][class*="-hol-"] button { border: 2px dashed #e8833a !important; }
+[class*="st-key-cell-P-"] button { background: #2e7d32 !important; color: #fff !important; border-color: #2e7d32; }
+[class*="st-key-cell-W-"] button { background: #f6c343 !important; color: #222 !important; border-color: #e0ad2a; }
+[class*="st-key-cell-"] button:hover { filter: brightness(1.08); }
+.cal-legend span { display: inline-block; padding: 1px 8px; border-radius: 6px; margin-right: 6px; font-size: .85rem; }
+</style>
+"""
+
+BRUSHES = {"🟢 Preferred": "Preferred", "🟡 Willing": "Willing", "⬜ Clear": None}
+
+
+def availability_calendar(block: dict, pid: int) -> None:
+    st.markdown(CAL_CSS, unsafe_allow_html=True)
+    st.markdown(
+        '<div class="cal-legend">Pick a marker, then tap days. Tap a day again to clear it. '
+        "Changes save automatically.<br>"
+        '<span style="background:#2e7d32;color:#fff">Preferred</span> want it'
+        '&nbsp;&nbsp;<span style="background:#f6c343;color:#222">Willing</span> will cover if needed'
+        '&nbsp;&nbsp;<span style="border:2px dashed #e8833a">🎉 Holiday</span>'
+        '&nbsp;&nbsp;<span style="background:rgba(120,140,170,.14)">Weekend</span></div>',
+        unsafe_allow_html=True,
+    )
+    calendar_fragment(block, pid)
+
+
+@st.fragment
+def calendar_fragment(block: dict, pid: int) -> None:
+    import calendar as _cal
+
+    bid = block["id"]
+    hol = core.get_holidays()
+    mine = core.get_person_avail(bid, pid)
+    days = core.block_dates(block)
+    in_block = {d.isoformat() for d in days}
+    months = sorted({(d.year, d.month) for d in days})
+    labels = [date(y, m, 1).strftime("%b %Y") for y, m in months]
+
+    c1, c2 = st.columns([3, 2])
+    brush_label = c1.segmented_control(
+        "Marker", list(BRUSHES), default="🟢 Preferred", key=f"brush_{bid}"
+    )
+    brush_label = brush_label or "🟢 Preferred"  # tapping the selected marker deselects it
+    brush = BRUSHES[brush_label]
+    n_pref = sum(v == "Preferred" for v in mine.values())
+    n_will = sum(v == "Willing" for v in mine.values())
+    c2.markdown(f"**Your picks this block:** {n_pref} preferred · {n_will} willing")
+
+    month_label = st.pills("Month", labels, default=labels[0], key=f"month_{bid}") or labels[0]
+    y, m = months[labels.index(month_label)]
+
+    with st.container(key="calgrid"):
+        cols = st.columns(7)
+        for i, name in enumerate(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]):
+            cols[i].markdown(f'<div class="dow">{name}</div>', unsafe_allow_html=True)
+        for week in _cal.Calendar(firstweekday=6).monthdatescalendar(y, m):
+            cols = st.columns(7)
+            for i, d in enumerate(week):
+                iso = d.isoformat()
+                if d.month != m or iso not in in_block:
+                    cols[i].write("")
+                    continue
+                lvl = mine.get(iso)
+                h = core.holiday_label(d, hol)
+                state = {"Preferred": "P", "Willing": "W"}.get(lvl, "N")
+                tags = ("we-" if d.weekday() >= 5 else "") + ("hol-" if h else "")
+                with cols[i].container(key=f"cell-{state}-{tags}{iso}"):
+                    label = f"{d.day}{' 🎉' if h else ''}"
+                    tip = d.strftime("%a %b %-d") + (f" — {h}" if h else "") + (f" — {lvl}" if lvl else "")
+                    if st.button(label, key=f"btn_{bid}_{iso}", help=tip, width="stretch"):
+                        new = None if lvl == brush else brush
+                        core.set_day_avail(bid, pid, iso, new)
+                        st.rerun(scope="fragment")
+
+    month_isos = [d.isoformat() for d in days if (d.year, d.month) == (y, m)]
+    we = [i for i in month_isos if date.fromisoformat(i).weekday() >= 5]
+    wd = [i for i in month_isos if date.fromisoformat(i).weekday() < 5]
+    hd = [i for i in month_isos if i in hol]
+    what = brush_label.split(" ", 1)[1]
+    st.caption(f"Quick fill for {month_label} (uses the {what} marker):")
+    b1, b2, b3, b4 = st.columns(4)
+    for col, text, isos in (
+        (b1, "All weekends", we), (b2, "All weekdays", wd), (b3, "All holidays", hd), (b4, "Whole month", month_isos),
+    ):
+        if col.button(text, key=f"bulk_{text}_{bid}_{y}{m}", width="stretch", disabled=not isos):
+            core.set_days_avail(bid, pid, isos, brush)
+            st.rerun(scope="fragment")
+
+
+def availability_list(block: dict, pid: int) -> None:
     st.caption(
         "Mark **Preferred** for dates you actively want, **Willing** for dates you'd cover if needed, "
         "and leave blank if you can't. Nothing is final until the scheduler assigns."
