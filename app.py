@@ -30,7 +30,8 @@ import hashlib  # noqa: E402
 
 with open(core.__file__, "rb") as _f:
     _core_sig = hashlib.sha1(_f.read()).hexdigest()
-_NEEDED = ("set_day_avail", "set_days_avail", "add_holiday_range", "holiday_label", "name_taken")
+_NEEDED = ("set_day_avail", "set_days_avail", "add_holiday_range", "holiday_label", "name_taken",
+           "set_assignment", "preferences_xlsx")
 if getattr(core, "_src_sig", None) != _core_sig or not all(hasattr(core, n) for n in _NEEDED):
     _old_pool = getattr(core, "_pool", None)
     core = importlib.reload(core)
@@ -184,9 +185,9 @@ def resident_page() -> None:
 
 CAL_CSS = """
 <style>
-.st-key-calgrid [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 4px !important; }
-.st-key-calgrid [data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }
-.st-key-calgrid .dow { text-align: center; font-size: .75rem; opacity: .7; font-weight: 600; }
+[class*="st-key-calgrid"] [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; gap: 4px !important; }
+[class*="st-key-calgrid"] [data-testid="stColumn"] { min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }
+[class*="st-key-calgrid"] .dow { text-align: center; font-size: .75rem; opacity: .7; font-weight: 600; }
 [class*="st-key-cell-"], [class*="st-key-cell-"] > div, [class*="st-key-cell-"] [data-testid="stButton"] { width: 100% !important; }
 [class*="st-key-cell-"] button {
     width: 100%; min-height: 3.1rem; padding: 2px 0 !important; font-size: .9rem; line-height: 1.1;
@@ -521,6 +522,119 @@ def tab_people() -> None:
             st.success("PIN updated.")
 
 
+ASSIGN_CSS = """
+<style>
+[class*="st-key-acell-"], [class*="st-key-acell-"] > div, [class*="st-key-acell-"] [data-testid="stButton"] { width: 100% !important; }
+[class*="st-key-acell-"] button {
+    width: 100%; min-height: 3.6rem; padding: 2px 3px !important; font-size: .8rem; line-height: 1.15;
+    overflow: hidden;
+}
+[class*="st-key-acell-"] button p { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin: 0; }
+[class*="st-key-acell-A-"] button { background: #1f6fb2 !important; color: #fff !important; border-color: #1f6fb2; }
+[class*="st-key-acell-O-"] button { background: rgba(246,195,67,.25) !important; border: 1px solid #e0ad2a !important; }
+[class*="st-key-acell-X-"] button { background: rgba(214,69,65,.18) !important; border: 1px solid #d64541 !important; }
+[class*="st-key-acell-"][class*="-hol-"] button { outline: 2px dashed #e8833a; outline-offset: -4px; }
+.assign-legend span { display: inline-block; padding: 1px 8px; border-radius: 6px; margin-right: 4px; font-size: .85rem; }
+</style>
+"""
+
+
+def short_name(name: str) -> str:
+    parts = name.split()
+    return name if len(parts) < 2 else f"{parts[0]} {parts[-1][0]}."
+
+
+@st.dialog("Assign coverage")
+def assign_dialog(bid: int, iso: str, ranked: list[int], avail_d: dict[int, str],
+                  stats: dict[int, dict], current: int | None, hol: dict[str, str]) -> None:
+    d = date.fromisoformat(iso)
+    h = core.holiday_label(d, hol)
+    st.markdown(f"### {d.strftime('%A, %B %-d, %Y')}" + (f"  \n🎉 {h}" if h else ""))
+    t = core.day_type(d, hol)
+
+    def label(pid):
+        if pid is None:
+            return "— Leave unassigned"
+        s = stats[pid]
+        lvl = avail_d.get(pid)
+        tag = "🟢 Preferred" if lvl == "Preferred" else "🟡 Willing" if lvl == "Willing" else "⚪ didn't volunteer"
+        return f"{s['name']} · {tag} · {sum(s['block'].values())} this block · {s['life'][t]} {t}s total"
+
+    show_all = st.checkbox("Include people who didn't volunteer for this date",
+                           value=bool(current and current not in avail_d))
+    others = sorted((p for p in stats if p not in avail_d), key=lambda p: stats[p]["name"]) if show_all else []
+    options = [None] + ranked + others
+    if not ranked:
+        st.info("Nobody volunteered for this date." + ("" if show_all else " Tick the box above to pick anyone."))
+    else:
+        st.caption("Volunteers are listed best match first.")
+    choice = st.radio("Who covers it?", options, format_func=label,
+                      index=options.index(current) if current in options else 0)
+    c1, c2 = st.columns(2)
+    if c1.button("Save", type="primary", width="stretch"):
+        core.set_assignment(bid, iso, choice)
+        st.rerun()
+    if c2.button("Cancel", width="stretch"):
+        st.rerun()
+
+
+def assign_calendar(block: dict, mode: str, hol: dict[str, str], avail: dict, stats: dict, assigned: dict) -> None:
+    import calendar as _cal
+
+    st.markdown(CAL_CSS + ASSIGN_CSS, unsafe_allow_html=True)
+    bid = block["id"]
+    days = core.block_dates(block)
+    in_block = {d.isoformat() for d in days}
+    n_a = sum(1 for d in in_block if assigned.get(d) in stats)
+    n_x = sum(1 for d in in_block if d not in assigned and not avail.get(d))
+    st.markdown(
+        '<div class="assign-legend">Click a day to choose who covers it.<br>'
+        f'<span style="background:#1f6fb2;color:#fff">Assigned</span> {n_a} '
+        f'&nbsp;<span style="background:rgba(246,195,67,.25);border:1px solid #e0ad2a">Open · has volunteers</span> '
+        f'{len(in_block) - n_a - n_x} '
+        f'&nbsp;<span style="background:rgba(214,69,65,.18);border:1px solid #d64541">No volunteers</span> {n_x} '
+        '&nbsp;<span style="outline:2px dashed #e8833a">🎉 Holiday</span></div>',
+        unsafe_allow_html=True,
+    )
+    months = sorted({(d.year, d.month) for d in days})
+    labels = [date(y, m, 1).strftime("%b %Y") for y, m in months]
+    month_label = st.pills("Month", labels, default=labels[0], key=f"amonth_{bid}") or labels[0]
+    y, m = months[labels.index(month_label)]
+
+    with st.container(key="calgrid-assign"):
+        cols = st.columns(7)
+        for i, name in enumerate(["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]):
+            cols[i].markdown(f'<div class="dow">{name}</div>', unsafe_allow_html=True)
+        for week in _cal.Calendar(firstweekday=6).monthdatescalendar(y, m):
+            cols = st.columns(7)
+            for i, d in enumerate(week):
+                iso = d.isoformat()
+                if d.month != m or iso not in in_block:
+                    cols[i].write("")
+                    continue
+                avail_d = avail.get(iso, {})
+                ranked = core.rank_candidates(d, avail_d, stats, mode, hol)
+                who = assigned.get(iso) if assigned.get(iso) in stats else None
+                h = core.holiday_label(d, hol)
+                state = "A" if who else "O" if ranked else "X"
+                tags = ("we-" if d.weekday() >= 5 else "") + ("hol-" if h else "")
+                if who:
+                    line2 = short_name(stats[who]["name"])
+                elif ranked:
+                    n_pref = sum(avail_d[p] == "Preferred" for p in ranked)
+                    line2 = f"{len(ranked)} vol" + (f" · {n_pref}★" if n_pref else "")
+                else:
+                    line2 = "no vol"
+                tip = d.strftime("%a %b %-d") + (f" — {h}" if h else "") + "\n" + (
+                    ", ".join(f"{stats[p]['name']}{' ★' if avail_d[p] == 'Preferred' else ''}" for p in ranked)
+                    or "No volunteers")
+                with cols[i].container(key=f"acell-{state}-{tags}{iso}"):
+                    if st.button(f"**{d.day}{' 🎉' if h else ''}**  \n{line2}", key=f"abtn_{bid}_{iso}",
+                                 help=tip, width="stretch"):
+                        assign_dialog(bid, iso, ranked, avail_d, stats, who, hol)
+    st.caption("★ = number of people who marked the day Preferred. Hover a day to see its volunteers.")
+
+
 def tab_assign() -> None:
     st.subheader("Assign coverage")
     blocks = core.get_blocks()
@@ -533,14 +647,13 @@ def tab_assign() -> None:
     )
     bid = block["id"]
 
-    c1, c2, c3 = st.columns([3, 1, 2])
+    c1, c2 = st.columns([3, 1])
     mode = c1.selectbox("Rank volunteers by", list(core.MODES), format_func=core.MODES.get)
     cap = c2.number_input("Max shifts / person", min_value=0, value=0, help="0 = no cap")
-    avoid = c3.checkbox("Avoid back-to-back days when possible", value=True)
 
-    b1, b2, _ = st.columns([1, 1, 4])
+    b1, b2, _ = st.columns([2, 1, 3])
     if b1.button("Auto-fill empty dates"):
-        n = core.autofill(bid, mode, int(cap), avoid)
+        n = core.autofill(bid, mode, int(cap))
         st.toast(f"Filled {n} dates. Review and adjust below.")
         st.rerun()
     if b2.button("Clear all"):
@@ -577,6 +690,16 @@ def tab_assign() -> None:
         )
     df = pd.DataFrame(rows)
 
+    if gaps:
+        st.warning(f"{len(gaps)} dates have no volunteers and no assignment yet.")
+
+    view = st.segmented_control(
+        "View", ["📅 Calendar", "📋 Table"], default="📅 Calendar", key="assign_view_mode"
+    ) or "📅 Calendar"
+    if view == "📅 Calendar":
+        assign_calendar(block, mode, hol, avail, stats, assigned)
+        return
+
     show = st.radio("Show", ["All", "Unassigned", "Weekends", "Weekdays", "Holidays"], horizontal=True, key="assign_view")
     mask = pd.Series(True, index=df.index)
     if show == "Unassigned":
@@ -585,9 +708,6 @@ def tab_assign() -> None:
         mask = df["Holiday"] != ""
     elif show in ("Weekends", "Weekdays"):
         mask = df["Type"] == {"Weekends": "weekend", "Weekdays": "weekday"}[show]
-
-    if gaps:
-        st.warning(f"{len(gaps)} dates have no volunteers and no assignment yet.")
 
     edited = st.data_editor(
         df[mask],
@@ -648,6 +768,14 @@ def tab_summary() -> None:
         type="primary",
     )
     c2.download_button("Download schedule CSV", out.to_csv(index=False), file_name="call_schedule.csv")
+
+    st.download_button(
+        "Download everyone's preferences (Excel)",
+        core.preferences_xlsx(block["id"]),
+        file_name=f"call_preferences_{block['name'].replace(' ', '_')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Grid of every date × person (P = Preferred, W = Willing), a by-person list, and totals.",
+    )
 
 
 def admin_page() -> None:
