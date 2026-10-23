@@ -280,6 +280,34 @@ def save_person_avail(block_id: int, person_id: int, avail: dict[str, str]) -> N
         )
 
 
+def set_day_avail(block_id: int, person_id: int, iso: str, level: str | None) -> None:
+    """Set (or clear, when level is None) one person's availability for one date."""
+    with conn() as c:
+        c.execute(
+            "DELETE FROM availability WHERE block_id=? AND person_id=? AND date=?",
+            (block_id, person_id, iso),
+        )
+        if level in LEVELS:
+            c.execute(
+                "INSERT INTO availability (block_id, person_id, date, level) VALUES (?,?,?,?)",
+                (block_id, person_id, iso, level),
+            )
+
+
+def set_days_avail(block_id: int, person_id: int, isos: list[str], level: str | None) -> None:
+    """Bulk version of set_day_avail."""
+    with conn() as c:
+        c.executemany(
+            "DELETE FROM availability WHERE block_id=? AND person_id=? AND date=?",
+            [(block_id, person_id, i) for i in isos],
+        )
+        if level in LEVELS:
+            c.executemany(
+                "INSERT INTO availability (block_id, person_id, date, level) VALUES (?,?,?,?)",
+                [(block_id, person_id, i, level) for i in isos],
+            )
+
+
 def get_block_avail(block_id: int) -> dict[str, dict[int, str]]:
     """date -> {person_id: level}, active people only."""
     out: dict[str, dict[int, str]] = {}
