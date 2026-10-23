@@ -20,7 +20,22 @@ try:
 except Exception:
     pass
 
+import importlib  # noqa: E402
+
 import core  # noqa: E402
+
+# Streamlit Cloud reruns app.py after a git pull but keeps the old `core` module in memory.
+# Reload it whenever core.py has changed on disk (closing the old DB pool first).
+_core_mtime = os.path.getmtime(core.__file__)
+if getattr(core, "_loaded_mtime", _core_mtime) != _core_mtime:
+    _old_pool = getattr(core, "_pool", None)
+    core = importlib.reload(core)
+    if _old_pool is not None:
+        try:
+            _old_pool.close()
+        except Exception:
+            pass
+core._loaded_mtime = _core_mtime
 
 
 @st.cache_resource
@@ -177,6 +192,7 @@ CAL_CSS = """
 [class*="st-key-cell-P-"] button { background: #2e7d32 !important; color: #fff !important; border-color: #2e7d32; }
 [class*="st-key-cell-W-"] button { background: #f6c343 !important; color: #222 !important; border-color: #e0ad2a; }
 [class*="st-key-cell-"] button:hover { filter: brightness(1.08); }
+[class*="st-key-cell-"][class*="-start-"] button { outline: 3px solid #1e88e5 !important; outline-offset: 1px; }
 .cal-legend span { display: inline-block; padding: 1px 8px; border-radius: 6px; margin-right: 6px; font-size: .85rem; }
 </style>
 """
@@ -187,7 +203,8 @@ BRUSHES = {"🟢 Preferred": "Preferred", "🟡 Willing": "Willing", "⬜ Clear"
 def availability_calendar(block: dict, pid: int) -> None:
     st.markdown(CAL_CSS, unsafe_allow_html=True)
     st.markdown(
-        '<div class="cal-legend">Pick a marker, then tap days. Tap a day again to clear it. '
+        '<div class="cal-legend">Pick a marker, then tap days (tap again to clear). '
+        "In <b>Range</b> mode, tap the first and last day to mark everything in between. "
         "Changes save automatically.<br>"
         '<span style="background:#2e7d32;color:#fff">Preferred</span> want it'
         '&nbsp;&nbsp;<span style="background:#f6c343;color:#222">Willing</span> will cover if needed'
@@ -220,6 +237,25 @@ def calendar_fragment(block: dict, pid: int) -> None:
     n_will = sum(v == "Willing" for v in mine.values())
     c2.markdown(f"**Your picks this block:** {n_pref} preferred · {n_will} willing")
 
+    tap_mode = st.segmented_control(
+        "Tap to mark", ["One day at a time", "↔ Range"], default="One day at a time", key=f"tapmode_{bid}"
+    ) or "One day at a time"
+    ranging = tap_mode == "↔ Range"
+    start_key = f"range_start_{bid}"
+    if not ranging:
+        st.session_state.pop(start_key, None)
+    start_iso = st.session_state.get(start_key)
+    if ranging:
+        if start_iso:
+            r1, r2 = st.columns([4, 1])
+            r1.info(f"Start: **{date.fromisoformat(start_iso).strftime('%a %b %-d')}** — now tap the last day "
+                    "(you can switch months first).")
+            if r2.button("Cancel", key=f"range_cancel_{bid}", width="stretch"):
+                st.session_state.pop(start_key, None)
+                st.rerun(scope="fragment")
+        else:
+            st.info("Tap the **first** day of the range.")
+
     month_label = st.pills("Month", labels, default=labels[0], key=f"month_{bid}") or labels[0]
     y, m = months[labels.index(month_label)]
 
@@ -237,13 +273,23 @@ def calendar_fragment(block: dict, pid: int) -> None:
                 lvl = mine.get(iso)
                 h = core.holiday_label(d, hol)
                 state = {"Preferred": "P", "Willing": "W"}.get(lvl, "N")
-                tags = ("we-" if d.weekday() >= 5 else "") + ("hol-" if h else "")
+                tags = ("we-" if d.weekday() >= 5 else "") + ("hol-" if h else "") + (
+                    "start-" if iso == start_iso else "")
                 with cols[i].container(key=f"cell-{state}-{tags}{iso}"):
                     label = f"{d.day}{' 🎉' if h else ''}"
                     tip = d.strftime("%a %b %-d") + (f" — {h}" if h else "") + (f" — {lvl}" if lvl else "")
                     if st.button(label, key=f"btn_{bid}_{iso}", help=tip, width="stretch"):
-                        new = None if lvl == brush else brush
-                        core.set_day_avail(bid, pid, iso, new)
+                        if ranging and not start_iso:
+                            st.session_state[start_key] = iso
+                        elif ranging:
+                            a, b = sorted([start_iso, iso])
+                            span = [x for x in sorted(in_block) if a <= x <= b]
+                            core.set_days_avail(bid, pid, span, brush)
+                            st.session_state.pop(start_key, None)
+                            st.toast(f"Marked {len(span)} day{'s' if len(span) != 1 else ''} as "
+                                     f"{brush or 'cleared'}.")
+                        else:
+                            core.set_day_avail(bid, pid, iso, None if lvl == brush else brush)
                         st.rerun(scope="fragment")
 
     month_isos = [d.isoformat() for d in days if (d.year, d.month) == (y, m)]
