@@ -337,6 +337,17 @@ def save_assignments(block_id: int, assigned: dict[str, int | None]) -> None:
         )
 
 
+def set_assignment(block_id: int, iso: str, person_id: int | None) -> None:
+    """Assign one date (or clear it when person_id is None)."""
+    with conn() as c:
+        c.execute("DELETE FROM assignments WHERE block_id=? AND date=?", (block_id, iso))
+        if person_id:
+            c.execute(
+                "INSERT INTO assignments (block_id, date, person_id) VALUES (?,?,?)",
+                (block_id, iso, person_id),
+            )
+
+
 # -------------------------------------------------------------------- stats
 def person_stats(block_id: int) -> dict[int, dict]:
     """Per active person: volunteer counts for this block, plus assigned shift
@@ -397,9 +408,7 @@ def rank_candidates(
     return sorted((p for p in avail_d if p in stats), key=key)
 
 
-def autofill(
-    block_id: int, mode: str = "pickup", max_per_person: int = 0, avoid_consecutive: bool = True
-) -> int:
+def autofill(block_id: int, mode: str = "pickup", max_per_person: int = 0) -> int:
     """Fill dates that have no assignment yet. Hardest dates (fewest volunteers)
     first. Never overrides an existing assignment. Returns number filled."""
     block = query("SELECT * FROM blocks WHERE id=?", (block_id,))[0]
@@ -417,14 +426,6 @@ def autofill(
         ranked = rank_candidates(d, avail[iso], stats, mode, hol)
         if max_per_person:
             ranked = [p for p in ranked if sum(stats[p]["block"].values()) < max_per_person]
-        if avoid_consecutive and ranked:
-            # Soft rule: within the same preference level, favor people who aren't
-            # already covering the day before/after. Never overrides Preferred vs Willing.
-            near = {assigned.get((d - timedelta(days=1)).isoformat()), assigned.get((d + timedelta(days=1)).isoformat())}
-            ranked = sorted(
-                ranked,
-                key=lambda p: (0 if avail[iso][p] == "Preferred" else 1, p in near, ranked.index(p)),
-            )
         if not ranked:
             continue
         pick = ranked[0]
@@ -546,6 +547,99 @@ def schedule_xlsx(block_id: int) -> bytes:
     header(wsum, cols, [26] + [12] * (len(cols) - 1))
     for r in summ.itertuples(index=False):
         wsum.append([_plain(v) for v in r])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# -------------------------------------------------------- preferences export
+def preferences_xlsx(block_id: int) -> bytes:
+    """Everyone's Preferred/Willing picks for a block.
+    Sheets: Grid (dates x people, color-coded), By person (long list), Totals."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    block = query("SELECT * FROM blocks WHERE id=?", (block_id,))[0]
+    hol = get_holidays()
+    rows = query(
+        """SELECT a.date, a.level, p.id AS pid, p.name, p.active FROM availability a
+           JOIN people p ON p.id = a.person_id WHERE a.block_id=? ORDER BY p.name, a.date""",
+        (block_id,),
+    )
+    people = sorted({(r["name"], r["pid"]) for r in rows})
+    pick = {(r["date"], r["pid"]): r["level"] for r in rows}
+
+    head_font = Font(bold=True, color="FFFFFF")
+    head_fill = PatternFill("solid", fgColor="1F4E78")
+    fill = {
+        "Preferred": PatternFill("solid", fgColor="C6EFCE"),
+        "Willing": PatternFill("solid", fgColor="FFEB9C"),
+        "weekend": PatternFill("solid", fgColor="DDEBF7"),
+        "holiday": PatternFill("solid", fgColor="FCE4D6"),
+    }
+
+    def header(ws, cols, widths, row=1):
+        for i, (c, w) in enumerate(zip(cols, widths), 1):
+            cell = ws.cell(row=row, column=i, value=c)
+            cell.font, cell.fill = head_font, head_fill
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+    wb = Workbook()
+
+    # Grid
+    ws = wb.active
+    ws.title = "Grid"
+    ws.append([f"{block['name']}  ({block['start_date']} to {block['end_date']}) - P = Preferred, W = Willing"])
+    ws["A1"].font = Font(bold=True, size=13)
+    cols = ["Date", "Day", "Type", "Holiday", "# Preferred", "# Willing"] + [n for n, _ in people]
+    header(ws, cols, [12, 6, 10, 18, 11, 10] + [12] * len(people), row=2)
+    ws.row_dimensions[2].height = 45
+    for d in block_dates(block):
+        iso = d.isoformat()
+        levels = [pick.get((iso, pid), "") for _, pid in people]
+        h = holiday_label(d, hol)
+        ws.append([d, d.strftime("%a"), day_type(d).title(), h,
+                   levels.count("Preferred"), levels.count("Willing")]
+                  + [{"Preferred": "P", "Willing": "W"}.get(x, "") for x in levels])
+        r = ws.max_row
+        ws.cell(row=r, column=1).number_format = "mm/dd/yyyy"
+        base = fill["holiday"] if h else fill["weekend"] if d.weekday() >= 5 else None
+        if base:
+            for c in range(1, 7):
+                ws.cell(row=r, column=c).fill = base
+        for i, lvl in enumerate(levels, 7):
+            cell = ws.cell(row=r, column=i)
+            cell.alignment = Alignment(horizontal="center")
+            if lvl:
+                cell.fill = fill[lvl]
+    ws.freeze_panes = "E3"
+    ws.auto_filter.ref = f"A2:{get_column_letter(len(cols))}{ws.max_row}"
+
+    # By person
+    wp = wb.create_sheet("By person")
+    header(wp, ["Person", "Date", "Day", "Type", "Holiday", "Preference"], [24, 12, 6, 10, 18, 12])
+    for r in rows:
+        d = date.fromisoformat(r["date"])
+        wp.append([r["name"], d, d.strftime("%a"), day_type(d).title(), holiday_label(d, hol), r["level"]])
+        wp.cell(row=wp.max_row, column=2).number_format = "mm/dd/yyyy"
+        wp.cell(row=wp.max_row, column=6).fill = fill[r["level"]]
+    wp.freeze_panes = "A2"
+    if wp.max_row > 1:
+        wp.auto_filter.ref = f"A1:F{wp.max_row}"
+
+    # Totals
+    wt = wb.create_sheet("Totals")
+    header(wt, ["Person", "Preferred", "Willing", "Total", "Weekend days", "Holiday days"], [24, 11, 10, 9, 13, 13])
+    for name, pid in people:
+        mine = [(iso, lvl) for (iso, p), lvl in pick.items() if p == pid]
+        n_p = sum(lvl == "Preferred" for _, lvl in mine)
+        n_w = sum(lvl == "Willing" for _, lvl in mine)
+        n_we = sum(date.fromisoformat(i).weekday() >= 5 for i, _ in mine)
+        n_h = sum(i in hol for i, _ in mine)
+        wt.append([name, n_p, n_w, n_p + n_w, n_we, n_h])
 
     buf = io.BytesIO()
     wb.save(buf)
